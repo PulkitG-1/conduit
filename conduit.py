@@ -1,4 +1,4 @@
-import collections, json, os, queue, re, subprocess, threading, time
+import collections, json, os, queue, re, urllib.request, subprocess, threading, time
 from datetime import datetime
 import numpy as np
 import sounddevice as sd, soundfile as sf, mlx_whisper
@@ -62,25 +62,36 @@ def osa(script):
     return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
 
 
-def act(name, args):
+def fail(error_type, message, try_instead=None):
+    """A failure the model can act on, instead of a bare string."""
+    out = {"ok": False, "error_type": error_type, "message": message}
+    if try_instead:
+        out["try_instead"] = try_instead
+    return json.dumps(out)
+
+
+def act(name, args):   # args already passed validate(), so enums are safe to index
     if name == "open_app":
         p = subprocess.run(["open", "-a", args["name"]], capture_output=True, text=True)
-        return (f"opened {args['name']}" if p.returncode == 0
-                else f"failed: {p.stderr.strip() or 'not found'}")
+        if p.returncode != 0:
+            return fail("app_not_found", f"No application named {args['name']!r} is installed.",
+                        "Tell the user it is not installed. Do not retry the same name.")
+        return f"opened {args['name']}"
 
     if name == "music_control":
-        verbs = {"play": "play", "pause": "pause",
-                 "next": "next track", "previous": "previous track"}
-        verb = verbs.get(args.get("action"))
-        if not verb:
-            return f"unknown action {args.get('action')!r}"
-        code, _, err = osa(f'tell application "Spotify" to {verb}')
-        return f"spotify {args['action']}" if code == 0 else f"spotify error: {err}"
+        verbs = {"play": "play", "pause": "pause", "next": "next track", "previous": "previous track"}
+        code, _, err = osa(f'tell application "Spotify" to {verbs[args["action"]]}')
+        if code != 0:
+            return fail("spotify_error", err or "Spotify did not respond.",
+                        "Open Spotify with open_app, then try again.")
+        return f"spotify {args['action']}"
 
     if name == "now_playing":
         code, out, err = osa('tell application "Spotify" to (name of current track) '
                              '& " by " & (artist of current track)')
-        return (out or "nothing playing") if code == 0 else f"spotify error: {err}"
+        if code != 0:
+            return fail("spotify_error", err or "Spotify did not respond.", "Spotify may not be open.")
+        return out or "nothing playing"
 
     if name == "get_calendar_today":
         return "10:00 standup, 15:00 design review"
@@ -95,13 +106,13 @@ def act(name, args):
         try:
             entries = [e for e in os.scandir(path) if not e.name.startswith(".")]
         except OSError as e:
-            return f"could not read {path}: {e}"
+            return fail("cannot_read_folder", str(e))
         if not entries:
             return f"{folder} is empty"
         recent = sorted(entries, key=lambda e: e.stat().st_mtime, reverse=True)[:5]
         return f"{len(entries)} items in {folder}. Most recent: " + ", ".join(e.name for e in recent)
 
-    return f"unknown tool: {name}"
+    return fail("unknown_tool", f"There is no tool called {name!r}.")
 
 
 def speak(text):
@@ -134,8 +145,18 @@ class Recorder:
         return np.concatenate(self.frames).flatten() if self.frames else None
 
 
+def pin_model():
+    """Ask Ollama to keep the model loaded indefinitely (its default unloads after 5 idle minutes)."""
+    req = urllib.request.Request(
+        "http://localhost:11434/api/generate",
+        data=json.dumps({"model": LLM_MODEL, "keep_alive": -1}).encode(),
+        headers={"Content-Type": "application/json"})
+    urllib.request.urlopen(req, timeout=120).read()
+
+
 def warmup():
     t = time.perf_counter()
+    pin_model()
     subprocess.run(["say", "-o", "recordings/_warmup.aiff", "warming up"])
     mlx_whisper.transcribe("recordings/_warmup.aiff", path_or_hf_repo=ASR_MODEL, language="en")
     client.chat.completions.create(model=LLM_MODEL,
@@ -225,7 +246,7 @@ ACTIONS = {"open_app", "music_control"}
 
 
 def ok(result):
-    return not result.startswith(("failed", "spotify error", "unknown", "error"))
+    return not result.startswith('{"ok": false')
 
 
 def confirm(name, args):
@@ -235,61 +256,84 @@ def confirm(name, args):
             "previous": "Previous track."}.get(args.get("action"), "Done.")
 
 
+CLAIMS = [
+    (re.compile(r"\b(opened|launched)\b", re.I), {"open_app"}),
+    (re.compile(r"\b(paused|skipped|resumed|now playing|is playing)\b", re.I),
+     {"music_control", "now_playing"}),
+]
+
+
+def unbacked_claim(text, succeeded):
+    """True if the reply claims an action that no successful tool call this turn backs up."""
+    return any(pat.search(text or "") and not (tools & succeeded) for pat, tools in CLAIMS)
+
+
+def finish(user_text, t0, asr_ms, llm_ms, tool_ms, reply, path):
+    print("agent:", reply, "" if path == "model" else f" [{path}]")
+    record(user_text, asr_ms, llm_ms, tool_ms, (time.perf_counter() - t0) * 1000, path=path)
+    speak(reply)
+
+
 def loop(user_text, t0, asr_ms):
     messages = [{"role": "system", "content": SYSTEM},
                 {"role": "user", "content": user_text}]
     llm_ms, tool_ms = [], []
+    succeeded, failures = set(), {}
 
     for _ in range(5):
         t = time.perf_counter()
         r = client.chat.completions.create(model=LLM_MODEL, messages=messages,
-                                           tools=TOOLS, max_tokens=400,
-                                           temperature=TEMP)
+                                           tools=TOOLS, max_tokens=400, temperature=TEMP)
         llm_ms.append((time.perf_counter() - t) * 1000)
         m = r.choices[0].message
 
         if not m.tool_calls and not (m.content or "").strip():
             break   # at temperature 0 the same request returns the same nothing
 
-        msg = {"role": "assistant", "content": m.content or ""}
-        if m.tool_calls:
-            msg["tool_calls"] = [tc.model_dump() for tc in m.tool_calls]
-        messages.append(msg)
-
         if not m.tool_calls:
-            print("agent:", m.content)
-            record(user_text, asr_ms, llm_ms, tool_ms, (time.perf_counter() - t0) * 1000)
-            speak(m.content)
-            return
+            if unbacked_claim(m.content, succeeded):
+                return finish(user_text, t0, asr_ms, llm_ms, tool_ms,
+                              "I didn't manage to do that.", "caught_claim")
+            return finish(user_text, t0, asr_ms, llm_ms, tool_ms, m.content, "model")
 
-        done = []
+        messages.append({"role": "assistant", "content": m.content or "",
+                         "tool_calls": [tc.model_dump() for tc in m.tool_calls]})
+
+        done, stuck = [], None
         for tc in m.tool_calls:
             t = time.perf_counter()
+            name = tc.function.name
             try:
                 args = json.loads(tc.function.arguments)
-                err = validate(tc.function.name, args)
-                result = f"error: {err}" if err else act(tc.function.name, args)
+                err = validate(name, args)
+                result = (fail("invalid_arguments", err, "Call the tool again using only the allowed arguments.")
+                          if err else act(name, args))
             except json.JSONDecodeError:
-                args, result = {}, f"error: bad arguments {tc.function.arguments!r}"
+                args = {}
+                result = fail("malformed_json", "Arguments were not valid JSON.",
+                              "Send the arguments as a JSON object.")
             tool_ms.append((time.perf_counter() - t) * 1000)
-            print(f"  tool {tc.function.name} -> {result}")
+            print(f"  tool {name} -> {result}")
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
-            done.append((tc.function.name, args, result))
+            done.append((name, args, result))
 
-        # fast path: a successful action needs no second model call
-        if all(n in ACTIONS and ok(r) for n, _, r in done):
-            reply = " ".join(confirm(n, a) for n, a, _ in done)
-            print("agent:", reply, " [fast path]")
-            record(user_text, asr_ms, llm_ms, tool_ms,
-                   (time.perf_counter() - t0) * 1000, path="fast")
-            speak(reply)
-            return
+            if ok(result):
+                succeeded.add(name)
+            else:
+                key = (name, json.dumps(args, sort_keys=True))
+                failures[key] = failures.get(key, 0) + 1
+                if failures[key] >= 2:
+                    stuck = json.loads(result).get("message", "")
 
-    reply = "Sorry, I can't do that yet."
-    print("agent:", reply, " [fallback]")
-    record(user_text, asr_ms, llm_ms, tool_ms,
-           (time.perf_counter() - t0) * 1000, path="failed")
-    speak(reply)
+        if stuck is not None:   # same call, same failure, twice: retrying won't help
+            return finish(user_text, t0, asr_ms, llm_ms, tool_ms,
+                          f"Sorry, I couldn't do that. {stuck}", "stuck")
+
+        if all(n in ACTIONS and ok(res) for n, _, res in done):
+            return finish(user_text, t0, asr_ms, llm_ms, tool_ms,
+                          " ".join(confirm(n, a) for n, a, _ in done), "fast")
+
+    finish(user_text, t0, asr_ms, llm_ms, tool_ms, "Sorry, I can't do that yet.", "failed")
 
 
 if __name__ == "__main__":

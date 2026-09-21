@@ -3,9 +3,9 @@ from openai import OpenAI
 from conduit import SYSTEM, TOOLS
 
 client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
-MODELS = ["qwen2.5:7b", "qwen2.5:3b", "qwen2.5:1.5b"]
+MODELS = ["qwen2.5:3b"]          # the one we ship; add others to compare
+NO_ACTION = (None, "unclear")   # either counts as correctly not acting
 
-# the set we tuned against: (utterance, expected tool, expected args)
 TUNED = [
     ("open Spotify", "open_app", None), ("open Chrome", "open_app", None),
     ("launch Slack", "open_app", None), ("play the music", "music_control", None),
@@ -19,10 +19,9 @@ TUNED = [
     ("what did I just copy", "get_clipboard", None),
     ("what files are in my downloads", "list_files", None),
     ("show me what's on my desktop", "list_files", None),
-    ("what can you do", None, None), ("hello", None, None),
+    ("what can you do", NO_ACTION, None), ("hello", NO_ACTION, None),
 ]
 
-# never seen during tuning, with arguments checked
 HELDOUT = [
     ("fire up Safari", "open_app", {"name": "safari"}),
     ("can you open the calculator", "open_app", {"name": "calculator"}),
@@ -35,10 +34,21 @@ HELDOUT = [
     ("read me what I copied", "get_clipboard", None),
     ("anything new in my documents", "list_files", {"folder": "documents"}),
     ("what's on my desktop", "list_files", {"folder": "desktop"}),
-    ("thanks", None, None),
-    ("how are you", None, None),
-    ("turn the volume up", None, None),   # no tool can do this: correct is to call nothing
+    ("thanks", NO_ACTION, None),
+    ("how are you", NO_ACTION, None),
+    ("turn the volume up", NO_ACTION, None),
 ]
+
+ADVERSARIAL = [   # garbled or meaningless: acting on these is the failure
+    ("welcome to party club", NO_ACTION, None),
+    ("banana keyboard", NO_ACTION, None),
+    ("the weather is nice today", NO_ACTION, None),
+    ("open lean on music", NO_ACTION + ("open_app",), None),
+    ("open Lena Music", ("open_app", "unclear"), None),
+    ("launch the app called Zorblax", "open_app", {"name": "zorblax"}),
+]
+
+SETS = {"tuned": TUNED, "held-out": HELDOUT, "adversarial": ADVERSARIAL}
 
 
 def run(model, text):
@@ -59,17 +69,17 @@ def run(model, text):
 
 
 def correct(got, args, want, want_args):
-    if got != want:
+    wants = want if isinstance(want, tuple) else (want,)
+    if got not in wants:
         return False
-    return all(str(v).lower() in str(args.get(k, "")).lower()
-               for k, v in (want_args or {}).items())
+    return all(str(v).lower() in str(args.get(k, "")).lower() for k, v in (want_args or {}).items())
 
 
 for model in MODELS:
     client.chat.completions.create(model=model, max_tokens=1,
                                    messages=[{"role": "user", "content": "hi"}])
-    times, report = [], []
-    for label, cases in (("tuned", TUNED), ("held-out", HELDOUT)):
+    times, scores, misses = [], [], []
+    for label, cases in SETS.items():
         hits = 0
         for text, want, want_args in cases:
             got, args, ms = run(model, text)
@@ -77,12 +87,8 @@ for model in MODELS:
             if correct(got, args, want, want_args):
                 hits += 1
             else:
-                report.append(f"   {label} miss: {text!r} -> {got} {args or ''}  (wanted {want} {want_args or ''})")
-        report.insert(0 if label == "tuned" else len(report), "")
-        print_line = f"{label} {hits}/{len(cases)}"
-        report.append(print_line) if False else None
-        globals().setdefault("scores", {}).setdefault(model, []).append(print_line)
-    print(f"\n{model:14} {'   '.join(scores[model])}   p50 {statistics.median(times):.0f}ms")
-    for line in report:
-        if line.strip():
-            print(line)
+                misses.append(f"   {label} miss: {text!r} -> {got} {args or ''}  (wanted {want} {want_args or ''})")
+        scores.append(f"{label} {hits}/{len(cases)}")
+    print(f"\n{model:14} {'   '.join(scores)}   p50 {statistics.median(times):.0f}ms")
+    for m in misses:
+        print(m)
