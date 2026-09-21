@@ -1,4 +1,4 @@
-import collections, json, os, queue, subprocess, threading, time
+import collections, json, os, queue, re, subprocess, threading, time
 from datetime import datetime
 import numpy as np
 import sounddevice as sd, soundfile as sf, mlx_whisper
@@ -158,6 +158,22 @@ def on_release(key):
             jobs.put((audio, time.perf_counter()))   # clock starts when you let go
 
 
+KNOWN_HALLUCINATIONS = {"you", "thank you", "thanks for watching", "bye"}
+
+
+def looks_hallucinated(text, seconds):
+    """Catch Whisper output that can't be real speech, whatever the model or prompt."""
+    t = re.sub(r"[^\w\s']", " ", text.lower()).strip()
+    if len(t) < 2 or t in KNOWN_HALLUCINATIONS:
+        return True
+    if len(t) / max(seconds, 0.1) > 30:          # faster than any human speaks
+        return True
+    words = t.split()
+    if len(words) >= 6 and len(set(words)) / len(words) < 0.3:   # "google play google play ..."
+        return True
+    return False
+
+
 def transcribe(audio, t0):
     path = f"recordings/{datetime.now():%Y%m%d-%H%M%S}.wav"
     sf.write(path, audio, RATE)
@@ -290,6 +306,9 @@ if __name__ == "__main__":
             try:
                 said, asr_ms = transcribe(audio, t0)
                 print("heard:", said)
+                if looks_hallucinated(said, len(audio) / RATE):
+                    print("  [dropped: looks like an ASR hallucination]")
+                    continue
                 if said.lower().strip(".!? ") in ("quit", "exit"):
                     break
                 if said:
