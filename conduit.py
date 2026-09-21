@@ -29,8 +29,8 @@ TOOLS = [
                        "properties": {"name": {"type": "string"}},
                        "required": ["name"]}}},
     {"type": "function", "function": {
-        "name": "music_control",
-        "description": "Play, pause, skip or go back in music.",
+        "name": "playback",
+        "description": "Play, pause, skip or go back a song.",
         "parameters": {"type": "object",
                        "properties": {"action": {"type": "string",
                                       "enum": ["play", "pause", "next", "previous"]}},
@@ -78,7 +78,7 @@ def act(name, args):   # args already passed validate(), so enums are safe to in
                         "Tell the user it is not installed. Do not retry the same name.")
         return f"opened {args['name']}"
 
-    if name == "music_control":
+    if name == "playback":
         verbs = {"play": "play", "pause": "pause", "next": "next track", "previous": "previous track"}
         code, _, err = osa(f'tell application "Spotify" to {verbs[args["action"]]}')
         if code != 0:
@@ -242,7 +242,7 @@ def validate(name, args):
     return None
 
 
-ACTIONS = {"open_app", "music_control"}
+ACTIONS = {"open_app", "playback"}
 
 
 def ok(result):
@@ -259,7 +259,7 @@ def confirm(name, args):
 CLAIMS = [
     (re.compile(r"\b(opened|launched)\b", re.I), {"open_app"}),
     (re.compile(r"\b(paused|skipped|resumed|now playing|is playing)\b", re.I),
-     {"music_control", "now_playing"}),
+     {"playback", "now_playing"}),
 ]
 
 
