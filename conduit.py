@@ -9,7 +9,7 @@ ASR_MODEL = "mlx-community/whisper-small-mlx"
 ASR_PROMPT = ("Voice commands for a Mac: open Spotify, play the music, pause, next song, "
               "what's playing, what's on my calendar, what's in my clipboard, "
               "what files are in my downloads, open Chrome.")
-LLM_MODEL = "qwen2.5:7b"
+LLM_MODEL = "qwen2.5:3b"
 TEMP = 0
 RATE = 16000
 HOTKEY = keyboard.Key.alt_r      # hold RIGHT Option to talk
@@ -29,8 +29,8 @@ TOOLS = [
                        "properties": {"name": {"type": "string"}},
                        "required": ["name"]}}},
     {"type": "function", "function": {
-        "name": "spotify_control",
-        "description": "Control music playback.",
+        "name": "music_control",
+        "description": "Play, pause, skip or go back in music.",
         "parameters": {"type": "object",
                        "properties": {"action": {"type": "string",
                                       "enum": ["play", "pause", "next", "previous"]}},
@@ -68,7 +68,7 @@ def act(name, args):
         return (f"opened {args['name']}" if p.returncode == 0
                 else f"failed: {p.stderr.strip() or 'not found'}")
 
-    if name == "spotify_control":
+    if name == "music_control":
         verbs = {"play": "play", "pause": "pause",
                  "next": "next track", "previous": "previous track"}
         verb = verbs.get(args.get("action"))
@@ -179,7 +179,33 @@ def record(said, asr_ms, llm_ms, tool_ms, total_ms, path="model"):
           f"| TOTAL {row['to_speech_ms']}ms")
 
 
-ACTIONS = {"open_app", "spotify_control"}
+SCHEMAS = {t["function"]["name"]: t["function"]["parameters"] for t in TOOLS}
+
+
+def validate(name, args):
+    """The schema is only a hint to the model. This is what actually enforces it."""
+    schema = SCHEMAS.get(name)
+    if schema is None:
+        return f"unknown tool {name}"
+    if not isinstance(args, dict):
+        return "arguments must be an object"
+    props = schema.get("properties", {})
+    for key in schema.get("required", []):
+        if key not in args:
+            return f"missing argument '{key}'; expected: {list(props)}"
+    for key, val in list(args.items()):
+        if key not in props:
+            return f"unexpected argument '{key}'; allowed: {list(props)}"
+        allowed = props[key].get("enum")
+        if allowed:
+            match = next((a for a in allowed if str(a).lower() == str(val).lower()), None)
+            if match is None:
+                return f"'{val}' is not a valid {key}; allowed: {allowed}"
+            args[key] = match
+    return None
+
+
+ACTIONS = {"open_app", "music_control"}
 
 
 def ok(result):
@@ -207,8 +233,7 @@ def loop(user_text, t0, asr_ms):
         m = r.choices[0].message
 
         if not m.tool_calls and not (m.content or "").strip():
-            print("  [empty, retrying]")
-            continue
+            break   # at temperature 0 the same request returns the same nothing
 
         msg = {"role": "assistant", "content": m.content or ""}
         if m.tool_calls:
@@ -226,7 +251,8 @@ def loop(user_text, t0, asr_ms):
             t = time.perf_counter()
             try:
                 args = json.loads(tc.function.arguments)
-                result = act(tc.function.name, args)
+                err = validate(tc.function.name, args)
+                result = f"error: {err}" if err else act(tc.function.name, args)
             except json.JSONDecodeError:
                 args, result = {}, f"error: bad arguments {tc.function.arguments!r}"
             tool_ms.append((time.perf_counter() - t) * 1000)
@@ -243,7 +269,11 @@ def loop(user_text, t0, asr_ms):
             speak(reply)
             return
 
-    print("agent: gave up")
+    reply = "Sorry, I can't do that yet."
+    print("agent:", reply, " [fallback]")
+    record(user_text, asr_ms, llm_ms, tool_ms,
+           (time.perf_counter() - t0) * 1000, path="failed")
+    speak(reply)
 
 
 if __name__ == "__main__":
