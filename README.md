@@ -50,6 +50,22 @@ The held-out cases were never looked at while tuning.
 1.5b was perfect on the cases I tuned against and 10/14 on unseen ones, so it overfit.
 3b generalised, so it's the default.
 
+## Speech recognition eval
+
+23 of my own recordings, labelled by hand. Exact = the whole command transcribed correctly.
+
+| setup | size | exact | WER | p50 |
+|---|---|---|---|---|
+| whisper-small, no prompt | 481 MB | 15/23 | 27.9% | 117 ms |
+| **whisper-small, command prompt** | **481 MB** | **21/23** | **7.2%** | **114 ms** |
+| large-v3-turbo, no prompt | 1.6 GB | 17/23 | 14.1% | 369 ms |
+| large-v3-turbo, command prompt | 1.6 GB | 18/23 | 9.8% | 371 ms |
+
+The model three times the size lost on accuracy and speed. The prompt was worth six
+clips to small and one to turbo. Small with the prompt also got every command that
+isn't in the prompt; turbo heard "notes" as "nodes" both times. Remaining open problem:
+single-word commands ("pause" heard as "voice").
+
 ## Things I got wrong
 
 - **Enums don't make wrong answers unrepresentable.** 1.5b sent `{"app": "Safari"}` instead of `{"name": ...}` and invented an action called `volume_up`. The schema is only a hint. Arguments are now validated in code before any tool runs, which also fixed a KeyError that would have crashed the agent.
