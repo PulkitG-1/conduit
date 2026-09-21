@@ -4,3 +4,5 @@ __pycache__/
 *.wav
 *.aiff
 turns.jsonl
+recordings/
+recordings/

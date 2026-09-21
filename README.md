@@ -42,6 +42,6 @@ open_app, spotify_control, now_playing, get_calendar_today, get_clipboard, list_
 ## Running
 
     uv venv && source .venv/bin/activate
-    uv pip install sounddevice soundfile mlx-whisper openai
+    uv pip install sounddevice soundfile mlx-whisper openai pynput pynput
     ollama pull qwen2.5:7b
-    python day1.py
+    python conduit.py

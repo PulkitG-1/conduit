@@ -1,11 +1,20 @@
-import json, os, subprocess, time
+import collections, json, os, queue, subprocess, threading, time
 from datetime import datetime
+import numpy as np
 import sounddevice as sd, soundfile as sf, mlx_whisper
 from openai import OpenAI
+from pynput import keyboard
 
 ASR_MODEL = "mlx-community/whisper-small-mlx"
+ASR_PROMPT = ("Voice commands for a Mac: open Spotify, play the music, pause, next song, "
+              "what's playing, what's on my calendar, what's in my clipboard, "
+              "what files are in my downloads, open Chrome.")
 LLM_MODEL = "qwen2.5:7b"
-RATE, SECONDS = 16000, 5
+TEMP = 0
+RATE = 16000
+HOTKEY = keyboard.Key.alt_r      # hold RIGHT Option to talk
+MIN_SECONDS = 0.3                # ignore accidental taps
+os.makedirs("recordings", exist_ok=True)
 
 client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
 
@@ -69,10 +78,9 @@ def act(name, args):
         return f"spotify {args['action']}" if code == 0 else f"spotify error: {err}"
 
     if name == "now_playing":
-        code, out, err = osa(
-            'tell application "Spotify" to (name of current track) '
-            '& " by " & (artist of current track)')
-        return out or "nothing playing" if code == 0 else f"spotify error: {err}"
+        code, out, err = osa('tell application "Spotify" to (name of current track) '
+                             '& " by " & (artist of current track)')
+        return (out or "nothing playing") if code == 0 else f"spotify error: {err}"
 
     if name == "get_calendar_today":
         return "10:00 standup, 15:00 design review"
@@ -85,9 +93,13 @@ def act(name, args):
         folder = args.get("folder", "Home")
         path = os.path.expanduser("~" if folder == "Home" else f"~/{folder}")
         try:
-            return ", ".join(sorted(os.listdir(path))[:20]) or "empty"
+            entries = [e for e in os.scandir(path) if not e.name.startswith(".")]
         except OSError as e:
             return f"could not read {path}: {e}"
+        if not entries:
+            return f"{folder} is empty"
+        recent = sorted(entries, key=lambda e: e.stat().st_mtime, reverse=True)[:5]
+        return f"{len(entries)} items in {folder}. Most recent: " + ", ".join(e.name for e in recent)
 
     return f"unknown tool: {name}"
 
@@ -97,20 +109,66 @@ def speak(text):
         subprocess.run(["say", text])
 
 
-def listen():
-    input("press enter, then speak: ")
-    audio = sd.rec(int(SECONDS * RATE), samplerate=RATE, channels=1, dtype="float32")
-    sd.wait()
-    t0 = time.perf_counter()
-    sf.write("turn.wav", audio, RATE)
-    text = mlx_whisper.transcribe("turn.wav", path_or_hf_repo=ASR_MODEL,
-                                  language="en")["text"].strip()
-    return text, t0, (time.perf_counter() - t0) * 1000
+class Recorder:
+    """Mic stays open; ~320ms of pre-roll so the first syllable isn't clipped."""
+    def __init__(self):
+        self.recording = False
+        self.frames = []
+        self.preroll = collections.deque(maxlen=10)   # 10 x 32ms blocks
+        self.stream = sd.InputStream(samplerate=RATE, channels=1, dtype="float32",
+                                     blocksize=512, callback=self._cb)
+        self.stream.start()
+
+    def _cb(self, indata, frames, t, status):
+        (self.frames if self.recording else self.preroll).append(indata.copy())
+
+    def start(self):
+        if not self.recording:
+            self.frames = list(self.preroll)
+            self.recording = True
+
+    def stop(self):
+        if not self.recording:
+            return None
+        self.recording = False
+        return np.concatenate(self.frames).flatten() if self.frames else None
+
+
+def warmup():
+    t = time.perf_counter()
+    subprocess.run(["say", "-o", "recordings/_warmup.aiff", "warming up"])
+    mlx_whisper.transcribe("recordings/_warmup.aiff", path_or_hf_repo=ASR_MODEL, language="en")
+    client.chat.completions.create(model=LLM_MODEL,
+                                   messages=[{"role": "user", "content": "hi"}], max_tokens=1)
+    print(f"warm in {(time.perf_counter() - t) * 1000:.0f}ms")
+
+
+rec, jobs, busy = Recorder(), queue.Queue(), threading.Event()
+
+
+def on_press(key):
+    if key == HOTKEY and not busy.is_set():
+        rec.start()
+
+
+def on_release(key):
+    if key == HOTKEY:
+        audio = rec.stop()
+        if audio is not None:
+            jobs.put((audio, time.perf_counter()))   # clock starts when you let go
+
+
+def transcribe(audio, t0):
+    path = f"recordings/{datetime.now():%Y%m%d-%H%M%S}.wav"
+    sf.write(path, audio, RATE)
+    text = mlx_whisper.transcribe(path, path_or_hf_repo=ASR_MODEL,
+                                  language="en", initial_prompt=ASR_PROMPT)["text"].strip()
+    return text, (time.perf_counter() - t0) * 1000
 
 
 def record(said, asr_ms, llm_ms, tool_ms, total_ms):
     row = {"ts": datetime.now().isoformat(timespec="seconds"), "said": said,
-           "model": LLM_MODEL, "asr": ASR_MODEL, "temp": 0,
+           "model": LLM_MODEL, "asr": ASR_MODEL, "temp": TEMP, "input": "hotkey", "asr_prompt": True,
            "asr_ms": round(asr_ms), "llm_ms": [round(x) for x in llm_ms],
            "tool_ms": [round(x) for x in tool_ms], "calls": len(llm_ms),
            "to_speech_ms": round(total_ms)}
@@ -128,8 +186,9 @@ def loop(user_text, t0, asr_ms):
 
     for _ in range(5):
         t = time.perf_counter()
-        r = client.chat.completions.create(
-            model=LLM_MODEL, messages=messages, tools=TOOLS, max_tokens=400, temperature=0)
+        r = client.chat.completions.create(model=LLM_MODEL, messages=messages,
+                                           tools=TOOLS, max_tokens=400,
+                                           temperature=TEMP)
         llm_ms.append((time.perf_counter() - t) * 1000)
         m = r.choices[0].message
 
@@ -162,10 +221,26 @@ def loop(user_text, t0, asr_ms):
 
 
 if __name__ == "__main__":
-    print("say 'quit' to stop")
-    while True:
-        said, t0, asr_ms = listen()
-        print("heard:", said)
-        if not said or said.lower().strip(".!? ") in ("quit", "exit", "stop"):
-            break
-        loop(said, t0, asr_ms)
+    warmup()
+    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+    listener.start()
+    print("hold RIGHT OPTION to talk, release to send. say 'quit' or Ctrl+C to stop.")
+    try:
+        while True:
+            audio, t0 = jobs.get()
+            if len(audio) < RATE * MIN_SECONDS:
+                continue
+            busy.set()
+            try:
+                said, asr_ms = transcribe(audio, t0)
+                print("heard:", said)
+                if said.lower().strip(".!? ") in ("quit", "exit"):
+                    break
+                if said:
+                    loop(said, t0, asr_ms)
+            finally:
+                busy.clear()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        listener.stop()
