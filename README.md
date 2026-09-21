@@ -1,47 +1,80 @@
 # Conduit
 
-A voice agent for macOS. Press a key, say what you want, your machine does it.
-Runs entirely on-device — no cloud API, no network call, no bill.
+A voice agent for macOS. Hold a key, say what you want, your machine does it.
+Runs entirely on-device. No cloud API, no network call, no bill.
 
-**Status:** day 2 of 22.
+**Status:** week 1. Actions answer in under a second.
 
 ## Why
 
-Voice loses to a keyboard on short, precise tasks. It wins on compound errands —
-"move my 3pm to tomorrow and tell Priya why" — which cost 30–120 seconds of
-navigating and context-switching, and four seconds spoken.
+Voice loses to a keyboard on short, precise tasks. It wins on compound errands,
+like "move my 3pm to tomorrow and tell Priya why", which cost 30 to 120 seconds
+of navigating and context-switching, and four seconds spoken.
 
-## Benchmarks
+## Latency
 
-End of speech → spoken reply. n=15, single configuration.
-qwen2.5:7b @ temp 0 via Ollama, whisper-small on MLX, M5 MacBook Air 16GB.
+Key released to spoken reply. qwen2.5:3b at temperature 0 via Ollama,
+whisper-small on MLX, M5 MacBook Air 16GB.
 
-| stage | day 2 | day 19 |
-|---|---|---|
-| ASR (after speech ends) | 274 ms | |
-| model (2–3 calls) | 1,448 ms | |
-| tool execution | ~30 ms | |
-| **total p50** | **1,761 ms** | |
-| total p95 | 2,955 ms | |
+| turn type | what happens | n | p50 |
+|---|---|---|---|
+| action (open app, play, pause) | 1 model call, templated reply | 3 | 974 ms |
+| query (what's playing, calendar) | 2 model calls | 1 | 1,258 ms |
+| can't do it | 1 model call, honest fallback | 1 | 696 ms |
 
-Started at 10,432 ms. Four changes, measured one at a time:
+Sample sizes on the current configuration are still small and will firm up with use.
+Started at 10,432 ms.
+
+## What moved the numbers
 
 | change | effect |
 |---|---|
-| dropped reasoning model (qwen3 to qwen2.5) | 8,700 ms to 1,900 ms |
-| raised max_tokens (reasoning truncated the tool call) | fixed silent empty responses |
-| temperature 1.0 to 0 | fewer retries, no malformed output |
-| one-line positive tool descriptions | correct tool selection |
+| reasoning model (qwen3) to non-reasoning (qwen2.5) | 10.4 s to about 1.9 s |
+| push-to-talk instead of a fixed 5 s recording window | no more waiting out the window |
+| list_files returns a count plus the 5 newest, not 20 names | 11.4 s to 3.9 s on that query |
+| ASR primed with the command list | first-word errors 4/9 to 1/9 on saved clips |
+| successful actions skip the second model call | about 1.9 s to 1.3 s |
+| qwen2.5:7b to 3b, chosen by the eval below | actions from about 1.3 s to under 1 s |
 
-Not yet measured: endpointing (currently push-to-talk) and TTS (currently macOS `say`).
+## Tool-choice eval
+
+32 utterances with a known correct tool, and correct arguments for the held-out set.
+The held-out cases were never looked at while tuning.
+
+| model | tuned (18) | held-out (14) | p50 |
+|---|---|---|---|
+| qwen2.5:7b | 17 | 12 | 868 ms |
+| qwen2.5:3b | 17 | 14 | 441 ms |
+| qwen2.5:1.5b | 18 | 10 | 300 ms |
+
+1.5b was perfect on the cases I tuned against and 10/14 on unseen ones, so it overfit.
+3b generalised, so it's the default.
+
+## Things I got wrong
+
+- **Enums don't make wrong answers unrepresentable.** 1.5b sent `{"app": "Safari"}` instead of `{"name": ...}` and invented an action called `volume_up`. The schema is only a hint. Arguments are now validated in code before any tool runs, which also fixed a KeyError that would have crashed the agent.
+- **A tool's name is part of its prompt.** Small models sent "open Spotify" to `spotify_control` until it was renamed `music_control`.
+- **Retrying at temperature 0 is pointless.** The same request gets the same answer.
+- **A benchmark without its configuration is contaminated data.** Every turn now logs the model, ASR settings and which path it took.
+
+## Known issues
+
+- Single-word commands are the weakest link: "pause" was heard as "voice". Next up is an ASR eval on saved recordings.
+- Ollama unloads an idle model after about 5 minutes, so the first turn after a break is slow.
 
 ## Tools
 
-open_app, spotify_control, now_playing, get_calendar_today, get_clipboard, list_files
+open_app, music_control, now_playing, get_calendar_today, get_clipboard, list_files
 
 ## Running
 
     uv venv && source .venv/bin/activate
-    uv pip install sounddevice soundfile mlx-whisper openai pynput pynput
-    ollama pull qwen2.5:7b
+    uv pip install sounddevice soundfile mlx-whisper openai pynput
+    ollama pull qwen2.5:3b
     python conduit.py
+
+Hold right Option to talk. macOS will ask for Microphone, Accessibility and
+Input Monitoring permission for your terminal.
+
+    python eval_tools.py    # tool-choice eval
+    python stats.py         # latency by model and turn type
