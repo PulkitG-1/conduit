@@ -166,17 +166,31 @@ def transcribe(audio, t0):
     return text, (time.perf_counter() - t0) * 1000
 
 
-def record(said, asr_ms, llm_ms, tool_ms, total_ms):
+def record(said, asr_ms, llm_ms, tool_ms, total_ms, path="model"):
     row = {"ts": datetime.now().isoformat(timespec="seconds"), "said": said,
            "model": LLM_MODEL, "asr": ASR_MODEL, "temp": TEMP, "input": "hotkey", "asr_prompt": True,
            "asr_ms": round(asr_ms), "llm_ms": [round(x) for x in llm_ms],
            "tool_ms": [round(x) for x in tool_ms], "calls": len(llm_ms),
-           "to_speech_ms": round(total_ms)}
+           "to_speech_ms": round(total_ms), "path": path}
     with open("turns.jsonl", "a") as f:
         f.write(json.dumps(row) + "\n")
     print(f"  asr {row['asr_ms']}ms | llm {sum(row['llm_ms'])}ms "
           f"({row['calls']} calls) | tool {sum(row['tool_ms'])}ms "
           f"| TOTAL {row['to_speech_ms']}ms")
+
+
+ACTIONS = {"open_app", "spotify_control"}
+
+
+def ok(result):
+    return not result.startswith(("failed", "spotify error", "unknown", "error"))
+
+
+def confirm(name, args):
+    if name == "open_app":
+        return f"Opened {args.get('name', 'it')}."
+    return {"play": "Playing.", "pause": "Paused.", "next": "Next track.",
+            "previous": "Previous track."}.get(args.get("action"), "Done.")
 
 
 def loop(user_text, t0, asr_ms):
@@ -207,15 +221,27 @@ def loop(user_text, t0, asr_ms):
             speak(m.content)
             return
 
+        done = []
         for tc in m.tool_calls:
             t = time.perf_counter()
             try:
-                result = act(tc.function.name, json.loads(tc.function.arguments))
+                args = json.loads(tc.function.arguments)
+                result = act(tc.function.name, args)
             except json.JSONDecodeError:
-                result = f"error: bad arguments {tc.function.arguments!r}"
+                args, result = {}, f"error: bad arguments {tc.function.arguments!r}"
             tool_ms.append((time.perf_counter() - t) * 1000)
             print(f"  tool {tc.function.name} -> {result}")
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+            done.append((tc.function.name, args, result))
+
+        # fast path: a successful action needs no second model call
+        if all(n in ACTIONS and ok(r) for n, _, r in done):
+            reply = " ".join(confirm(n, a) for n, a, _ in done)
+            print("agent:", reply, " [fast path]")
+            record(user_text, asr_ms, llm_ms, tool_ms,
+                   (time.perf_counter() - t0) * 1000, path="fast")
+            speak(reply)
+            return
 
     print("agent: gave up")
 
