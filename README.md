@@ -69,18 +69,18 @@ single-word commands ("pause" heard as "voice").
 ## Things I got wrong
 
 - **Enums don't make wrong answers unrepresentable.** 1.5b sent `{"app": "Safari"}` instead of `{"name": ...}` and invented an action called `volume_up`. The schema is only a hint. Arguments are now validated in code before any tool runs, which also fixed a KeyError that would have crashed the agent.
-- **A tool's name is part of its prompt.** Small models sent "open Spotify" to `spotify_control` until it was renamed `music_control`.
+- **A tool's name is part of its prompt, and fixing one leak can create another.** Small models sent "open Spotify" to `spotify_control`. Renaming it `music_control` fixed that, then pulled "open Lena Music" and "welcome to party club" into playing music. Renaming it `playback` fixed both with no regressions (adversarial cases 2/6 to 4/6).
+- **A retry needs a reason to succeed.** The model retried a missing app under the same name. Tool errors now say what to try instead, and the same failed call twice ends the turn.
 - **Retrying at temperature 0 is pointless.** The same request gets the same answer.
 - **A benchmark without its configuration is contaminated data.** Every turn now logs the model, ASR settings and which path it took.
 
 ## Known issues
 
 - Single-word commands are the weakest link: "pause" was heard as "voice". Next up is an ASR eval on saved recordings.
-- Ollama unloads an idle model after about 5 minutes, so the first turn after a break is slow.
 
 ## Tools
 
-open_app, music_control, now_playing, get_calendar_today, get_clipboard, list_files
+open_app, playback, now_playing, get_calendar_today, get_clipboard, list_files
 
 ## Running
 
