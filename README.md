@@ -18,8 +18,9 @@ whisper-small on MLX, M5 MacBook Air 16GB.
 
 | turn type | what happens | n | p50 |
 |---|---|---|---|
-| action (open app, play, pause) | 1 model call, templated reply | 3 | 974 ms |
-| query (what's playing, calendar) | 2 model calls | 1 | 1,258 ms |
+| action, phrase already cached | 1 model call, no speech to generate | 2 | ~790 ms |
+| action, new phrase | 1 model call plus ~300 ms of speech | 1 | ~960 ms |
+| query answered from the tool result | 1 model call, no summarising call | 2 | ~800 ms |
 | can't do it | 1 model call, honest fallback | 1 | 696 ms |
 
 Sample sizes on the current configuration are still small and will firm up with use.
@@ -74,9 +75,24 @@ single-word commands ("pause" heard as "voice").
 - **Retrying at temperature 0 is pointless.** The same request gets the same answer.
 - **A benchmark without its configuration is contaminated data.** Every turn now logs the model, ASR settings and which path it took.
 
+- **Telling a small model to be brief does not work.** "Reply in at most 15 words" was
+  ignored, and it cost an adversarial eval case. Shaping what the tool returns worked instead.
+
 ## Known issues
 
 - Single-word commands are the weakest link: "pause" was heard as "voice". Next up is an ASR eval on saved recordings.
+
+## Speech
+
+Kokoro (82M, ONNX, CPU) instead of the macOS `say` voice. Its first call costs about
+800 ms of setup, paid during warmup; after that a sentence takes 240 to 320 ms. Spoken
+lines are cached to disk, so repeated confirmations cost nothing and the common commands
+are faster than they were with `say`. Pressing the hotkey while it speaks cuts the audio
+off and starts listening.
+
+Some tool results are already an answer ("39 items in Downloads"), so those are spoken
+directly instead of asking the model to summarise them. That removed a whole model call
+and took the query path from about 2.3 s to 0.8 s.
 
 ## Tools
 
