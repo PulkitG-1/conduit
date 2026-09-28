@@ -1,4 +1,4 @@
-import collections, json, os, queue, re, urllib.request, subprocess, threading, time
+import collections, hashlib, json, os, queue, re, urllib.request, subprocess, threading, time
 from datetime import datetime
 import numpy as np
 import sounddevice as sd, soundfile as sf, mlx_whisper
@@ -15,6 +15,9 @@ RATE = 16000
 HOTKEY = keyboard.Key.alt_r      # hold RIGHT Option to talk
 MIN_SECONDS = 0.3                # ignore accidental taps
 os.makedirs("recordings", exist_ok=True)
+os.makedirs("tts_cache", exist_ok=True)
+TTS_MODEL, TTS_VOICES, VOICE = "kokoro-v1.0.onnx", "voices-v1.0.bin", "af_heart"
+kokoro = None
 
 client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
 
@@ -109,15 +112,82 @@ def act(name, args):   # args already passed validate(), so enums are safe to in
             return fail("cannot_read_folder", str(e))
         if not entries:
             return f"{folder} is empty"
-        recent = sorted(entries, key=lambda e: e.stat().st_mtime, reverse=True)[:5]
-        return f"{len(entries)} items in {folder}. Most recent: " + ", ".join(e.name for e in recent)
+        newest = max(entries, key=lambda e: e.stat().st_mtime).name
+        return f"{len(entries)} items in {folder}. Newest is {newest}"
 
     return fail("unknown_tool", f"There is no tool called {name!r}.")
 
 
+speaker = None                     # a `say` process, used only as a fallback
+speaking = threading.Event()       # true while audio is playing
+TTS_CACHE = {}                     # text -> (samples, rate), so repeats cost nothing
+
+PRESET_LINES = ["Playing.", "Paused.", "Next track.", "Previous track.",
+                "Sorry, I can't do that yet.", "I didn't manage to do that.",
+                "Sorry, I didn't catch that. Could you say it again?"]
+
+
+def load_tts():
+    """Kokoro's first call costs ~800ms of setup. Pay it here, not mid-conversation."""
+    global kokoro
+    if not (os.path.exists(TTS_MODEL) and os.path.exists(TTS_VOICES)):
+        print("  [kokoro files missing, falling back to macOS say]")
+        return
+    from kokoro_onnx import Kokoro
+    kokoro = Kokoro(TTS_MODEL, TTS_VOICES)
+    kokoro.create("warm up", voice=VOICE)
+    threading.Thread(target=lambda: [synth(t) for t in PRESET_LINES], daemon=True).start()
+
+
+def synth(text):
+    """(samples, rate, ms_generating). 0ms means it came from the cache."""
+    if text in TTS_CACHE:
+        samples, rate = TTS_CACHE[text]
+        return samples, rate, 0.0
+    path = os.path.join("tts_cache", hashlib.sha1(text.encode()).hexdigest()[:16] + ".wav")
+    if os.path.exists(path):
+        samples, rate = sf.read(path, dtype="float32")
+        TTS_CACHE[text] = (samples, rate)
+        return samples, rate, 0.0
+    t = time.perf_counter()
+    samples, rate = kokoro.create(text, voice=VOICE)
+    ms = (time.perf_counter() - t) * 1000
+    TTS_CACHE[text] = (samples, rate)
+    sf.write(path, samples, rate)
+    return samples, rate, ms
+
+
+def stop_speaking():
+    """Cut off whatever is playing. True if there was anything."""
+    global speaker
+    hit = False
+    if speaking.is_set():
+        sd.stop()
+        hit = True
+    if speaker is not None and speaker.poll() is None:
+        speaker.terminate()
+        hit = True
+    return hit
+
+
 def speak(text):
-    if text:
-        subprocess.run(["say", text])
+    """Returns ms spent generating audio: 0 when the line was already cached."""
+    global speaker
+    if not text:
+        return 0.0
+    if kokoro is None:
+        speaker = subprocess.Popen(["say", text])
+        speaker.wait()
+        speaker = None
+        return 0.0
+    samples, rate, ms = synth(text)
+    speaking.set()
+    try:
+        sd.play(np.asarray(samples), rate)
+        sd.wait()
+    finally:
+        speaking.clear()
+    return ms
 
 
 class Recorder:
@@ -157,6 +227,7 @@ def pin_model():
 def warmup():
     t = time.perf_counter()
     pin_model()
+    load_tts()
     subprocess.run(["say", "-o", "recordings/_warmup.aiff", "warming up"])
     mlx_whisper.transcribe("recordings/_warmup.aiff", path_or_hf_repo=ASR_MODEL, language="en")
     client.chat.completions.create(model=LLM_MODEL,
@@ -168,7 +239,12 @@ rec, jobs, busy = Recorder(), queue.Queue(), threading.Event()
 
 
 def on_press(key):
-    if key == HOTKEY and not busy.is_set():
+    if key != HOTKEY:
+        return
+    if stop_speaking():          # barge-in: cut the reply short and listen again
+        print("  [interrupted]")
+        rec.start()
+    elif not busy.is_set():
         rec.start()
 
 
@@ -203,17 +279,17 @@ def transcribe(audio, t0):
     return text, (time.perf_counter() - t0) * 1000
 
 
-def record(said, asr_ms, llm_ms, tool_ms, total_ms, path="model"):
+def record(said, asr_ms, llm_ms, tool_ms, total_ms, path="model", tts_ms=0):
     row = {"ts": datetime.now().isoformat(timespec="seconds"), "said": said,
            "model": LLM_MODEL, "asr": ASR_MODEL, "temp": TEMP, "input": "hotkey", "asr_prompt": True,
            "asr_ms": round(asr_ms), "llm_ms": [round(x) for x in llm_ms],
            "tool_ms": [round(x) for x in tool_ms], "calls": len(llm_ms),
-           "to_speech_ms": round(total_ms), "path": path}
+           "to_speech_ms": round(total_ms), "path": path, "tts_ms": round(tts_ms)}
     with open("turns.jsonl", "a") as f:
         f.write(json.dumps(row) + "\n")
     print(f"  asr {row['asr_ms']}ms | llm {sum(row['llm_ms'])}ms "
           f"({row['calls']} calls) | tool {sum(row['tool_ms'])}ms "
-          f"| TOTAL {row['to_speech_ms']}ms")
+          f"| TOTAL {row['to_speech_ms']}ms | tts {row['tts_ms']}ms")
 
 
 SCHEMAS = {t["function"]["name"]: t["function"]["parameters"] for t in TOOLS}
@@ -243,6 +319,8 @@ def validate(name, args):
 
 
 ACTIONS = {"open_app", "playback"}
+# tools whose result is already a spoken answer: no second model call needed
+SPEAKABLE = {"now_playing", "get_calendar_today", "list_files"}
 
 
 def ok(result):
@@ -270,8 +348,9 @@ def unbacked_claim(text, succeeded):
 
 def finish(user_text, t0, asr_ms, llm_ms, tool_ms, reply, path):
     print("agent:", reply, "" if path == "model" else f" [{path}]")
-    record(user_text, asr_ms, llm_ms, tool_ms, (time.perf_counter() - t0) * 1000, path=path)
-    speak(reply)
+    total = (time.perf_counter() - t0) * 1000
+    tts_ms = speak(reply)
+    record(user_text, asr_ms, llm_ms, tool_ms, total, path=path, tts_ms=tts_ms)
 
 
 def loop(user_text, t0, asr_ms):
@@ -328,6 +407,10 @@ def loop(user_text, t0, asr_ms):
         if stuck is not None:   # same call, same failure, twice: retrying won't help
             return finish(user_text, t0, asr_ms, llm_ms, tool_ms,
                           f"Sorry, I couldn't do that. {stuck}", "stuck")
+
+        if all(n in SPEAKABLE and ok(res) for n, _, res in done):
+            return finish(user_text, t0, asr_ms, llm_ms, tool_ms,
+                          " ".join(res for _, _, res in done), "tool")
 
         if all(n in ACTIONS and ok(res) for n, _, res in done):
             return finish(user_text, t0, asr_ms, llm_ms, tool_ms,

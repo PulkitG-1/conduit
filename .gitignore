@@ -6,3 +6,6 @@ __pycache__/
 turns.jsonl
 recordings/
 recordings/
+kokoro-v1.0.onnx
+voices-v1.0.bin
+tts_cache/
