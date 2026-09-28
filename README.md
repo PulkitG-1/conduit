@@ -78,9 +78,24 @@ single-word commands ("pause" heard as "voice").
 - **Telling a small model to be brief does not work.** "Reply in at most 15 words" was
   ignored, and it cost an adversarial eval case. Shaping what the tool returns worked instead.
 
+- **Telling a small model to be brief does not work.** "Reply in at most 15 words" was
+  ignored, and it cost an adversarial eval case. Shaping what the tool returns worked instead.
+
 ## Known issues
 
 - Single-word commands are the weakest link: "pause" was heard as "voice". Next up is an ASR eval on saved recordings.
+
+## Speech
+
+Kokoro (82M, ONNX, CPU) instead of the macOS `say` voice. Its first call costs about
+800 ms of setup, paid during warmup; after that a sentence takes 240 to 320 ms. Spoken
+lines are cached to disk, so repeated confirmations cost nothing and the common commands
+are faster than they were with `say`. Pressing the hotkey while it speaks cuts the audio
+off and starts listening.
+
+Some tool results are already an answer ("39 items in Downloads"), so those are spoken
+directly instead of asking the model to summarise them. That removed a whole model call
+and took the query path from about 2.3 s to 0.8 s.
 
 ## Speech
 
